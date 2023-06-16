@@ -1,3 +1,5 @@
+use core::num;
+
 use anchor_lang::prelude::*;
 use anchor_spl::{
     associated_token::AssociatedToken,
@@ -9,6 +11,8 @@ declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 const LP_TOKEN_SEED: &'static [u8] = b"liquidity_token";
 const AMM_STATE_SEED: &'static [u8] = b"amm_state";
 const POOL_SEED: &'static [u8] = b"pool";
+
+const LP_FEES_BASIS_POINTS: &u64 = &30;
 
 pub fn quote(amount_a: u64, token_a_reserves: u64, token_b_reserves: u64) -> Result<u64> {
     require!(amount_a > 0, ErrorCodes::InsufficientAmountToDeposit);
@@ -32,6 +36,16 @@ pub fn get_quote(token_a_reserves: u64, token_b_reserves: u64, amount_a_desired:
             Ok((amount_a_optimal, amount_b_desired)) 
         }
     }
+}
+
+pub fn get_amount_out(amount_in: u64, reserve_in: u64, reserve_out: u64) -> Result<u64> {
+    require!(amount_in > 0, ErrorCodes::InsufficientInputAmountForSwap); 
+    require!(reserve_in > 0 && reserve_out > 0, ErrorCodes::InsufficientLiquidity); 
+    let amount_in_with_fee = amount_in * (10000 - LP_FEES_BASIS_POINTS);
+    let numerator = amount_in_with_fee * reserve_out;
+    let denominator = (reserve_in * 10000) + amount_in_with_fee;
+    let amount_out = numerator / denominator;
+    Ok(amount_out)
 }
 
 #[program]
@@ -60,7 +74,7 @@ pub mod simple_amm {
 
     // Creates liquidity
     pub fn add_liquidity(ctx: Context<AddLiquidity>, lp_token_bump: u8, amount_a_desired: u64, amount_b_desired: u64, amount_a_min: u64, amount_b_min: u64) -> Result<()> {
-        msg!("Called successfully");
+        msg!("Add liquidity Called successfully");
 
         let lp_token_mint = &ctx.accounts.liquidity_token_mint;
         let token_a_mint = ctx.accounts.token_a_mint.key();
@@ -132,7 +146,72 @@ pub mod simple_amm {
         Ok(())
     }
 
-    pub fn swap_token_for_token(ctx: Context<SwapToken>) -> Result<()> {
+    pub fn swap_token_for_token(ctx: Context<SwapToken>, amount_out_pool_bump: u8, amount_in_mint: Pubkey, amount_in: u64, amount_out_min: u64) -> Result<()> {
+        msg!("You were able to call swap token for token");
+
+        let token_a_mint = ctx.accounts.token_a_mint.key();
+        let token_b_mint = ctx.accounts.token_b_mint.key();
+        let token_a_pool = &ctx.accounts.token_a_pool;
+        let token_b_pool = &ctx.accounts.token_b_pool; 
+        let token_a_account = &ctx.accounts.token_a_account;
+        let token_b_account = &ctx.accounts.token_b_account;
+
+        // Get reserves
+        let token_a_reserves = token_a_pool.amount;
+        let token_b_reserves = token_b_pool.amount;
+
+        let mut amount_out = 0;
+
+        let (token_account_to_debit_from, token_account_to_credit_to, token_pool_to_debit_from, token_pool_to_credit_to) = if amount_in_mint == token_a_mint {
+            amount_out = get_amount_out(amount_in, token_a_reserves, token_b_reserves).unwrap();
+            (token_a_account, token_b_account, token_b_pool, token_a_pool)
+        } else if amount_in_mint == token_b_mint {
+            amount_out = get_amount_out(amount_in, token_b_reserves, token_a_reserves).unwrap();
+            (token_b_account, token_a_account, token_a_pool, token_b_pool)
+        } else {
+            return Err(error!(ErrorCodes::InvalidTokenMint));
+        };
+
+        require!(amount_out >= amount_out_min, ErrorCodes::InsufficientOutputAmountForSwap);
+        
+        // Swapping tokens
+
+        // SEEDS for PDA for CPI call
+        let bump_vector = amount_out_pool_bump.to_le_bytes();
+        let inner = vec![
+            POOL_SEED,
+            token_a_mint.as_ref(),
+            token_b_mint.as_ref(),
+            bump_vector.as_ref(),
+        ];
+        let outer = vec![inner.as_slice()];
+
+        let transfer_instruction_a = Transfer {
+            from: token_account_to_debit_from.to_account_info(),
+            to: token_pool_to_credit_to.to_account_info(),
+            authority: ctx.accounts.trader.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            transfer_instruction_a,
+            outer.as_slice(), //signer PDA
+        );
+        anchor_spl::token::transfer(cpi_ctx, amount_in)?;
+
+        let transfer_instruction_b = Transfer {
+            from: token_pool_to_debit_from.to_account_info(),
+            to: token_account_to_credit_to.to_account_info(),
+            authority: token_pool_to_debit_from.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            transfer_instruction_b,
+            outer.as_slice(), //signer PDA
+        );
+        anchor_spl::token::transfer(cpi_ctx, amount_out)?;
+
+        msg!("Transfer of {} tokens for {} tokens successful", amount_out, amount_in);
+
         Ok(())
     }
 }
@@ -197,7 +276,37 @@ pub struct AddLiquidity<'info> {
 pub struct RemoveLiquidity {}
 
 #[derive(Accounts)]
-pub struct SwapToken {}
+pub struct SwapToken<'info> {
+    #[account(mut)]
+    pub trader: Signer<'info>,
+    #[account(mut, seeds = [AMM_STATE_SEED], bump)]
+    pub amm_state: Account<'info, AmmState>,
+    pub token_a_mint: Box<Account<'info, Mint>>,
+    pub token_b_mint: Box<Account<'info, Mint>>,
+    #[account(
+        init_if_needed,
+        payer = trader,
+        associated_token::mint = token_a_mint, 
+        associated_token::authority =trader 
+    )]
+    pub token_a_account: Account<'info, TokenAccount>,
+    #[account(
+        init_if_needed,
+        payer = trader,
+        associated_token::mint = token_b_mint, 
+        associated_token::authority =trader 
+
+    )]
+    pub token_b_account: Account<'info, TokenAccount>,
+    #[account(mut, seeds = [POOL_SEED, token_a_mint.key().as_ref() , token_b_mint.key().as_ref()], bump, token::mint = token_a_mint, token::authority = token_a_pool)]
+    pub token_a_pool: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [POOL_SEED, token_b_mint.key().as_ref() , token_a_mint.key().as_ref()], bump, token::mint = token_b_mint, token::authority = token_b_pool)]
+    pub token_b_pool: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
 
 #[account]
 #[derive(InitSpace)]
@@ -222,5 +331,11 @@ pub enum ErrorCodes {
     #[msg("Insufficient token B amount")]
     InsufficientTokenBAmount,
     #[msg("Insufficient token A amount")]
-    InsufficientTokenAAmount
+    InsufficientTokenAAmount,
+    #[msg("Token mint to match any one in the pair")]
+    InvalidTokenMint,
+    #[msg("The amount of tokens to swap are insufficient, maybe equal to 0")]
+    InsufficientInputAmountForSwap,
+    #[msg("The amount of tokens to output are lesser than the minimum")]
+    InsufficientOutputAmountForSwap
 }

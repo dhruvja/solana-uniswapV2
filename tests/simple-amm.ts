@@ -206,7 +206,7 @@ describe("simple-amm", () => {
     console.log("Your transaction signature", tx);
   });
 
-  it("Add liquidity", async () => {
+  it("Create a token pair", async () => {
     const { ammStatePDA } = getAmmStatePDA();
     const { tokenPoolPDA: tokenAPoolPDA, tokenPoolBump: tokenAPoolBump } =
       getTokenPoolPDA(tokenAMint, tokenBMint);
@@ -258,7 +258,54 @@ describe("simple-amm", () => {
       );
       assert.equal(bobLiquidityTokenAccountUpdated.amount, lpTokenToBeMinted);
     } catch (e) {
-      console.log("this is error", e);
+      console.log("this is error in add liqudity", e);
+    }
+  });
+
+  it("Swap token for a token", async () => {
+    const { ammStatePDA } = getAmmStatePDA();
+    const { tokenPoolPDA: tokenAPoolPDA, tokenPoolBump: tokenAPoolBump } =
+      getTokenPoolPDA(tokenAMint, tokenBMint);
+    const { tokenPoolPDA: tokenBPoolPDA, tokenPoolBump: tokenBPoolBump } =
+      getTokenPoolPDA(tokenBMint, tokenAMint);
+    const amountIn = 2;
+    try {
+      let aliceAccountABeforeSwap = await spl.getAccount(provider.connection, aliceTokenAAccount);
+      let aliceAccountBBeforeSwap = await spl.getAccount(provider.connection, aliceTokenBAccount);
+      const tx = await program.methods
+        .swapTokenForToken(tokenAPoolBump, tokenBMint, new anchor.BN(amountIn), new anchor.BN(1))
+        .accounts({
+          trader: alice.publicKey,
+          ammState: ammStatePDA,
+          tokenAMint: tokenAMint,
+          tokenBMint: tokenBMint,
+          tokenAAccount: aliceTokenAAccount,
+          tokenBAccount: aliceTokenBAccount,
+          tokenAPool: tokenAPoolPDA,
+          tokenBPool: tokenBPoolPDA,
+          tokenProgram: spl.TOKEN_PROGRAM_ID,
+          associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
+          systemProgram: anchor.web3.SystemProgram.programId,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .signers([alice])
+        .rpc();
+
+      let tokenAReserves = (await spl.getAccount(provider.connection, tokenAPoolPDA)).amount;
+      let tokenBReserves = (await spl.getAccount(provider.connection, tokenBPoolPDA)).amount;
+
+      let amountInWithFee = amountIn * (10000 - lpBasisFeePoints);
+      let numerator = amountInWithFee * Number(tokenAReserves);
+      let denominator = (Number(tokenBReserves) * 10000 ) + amountInWithFee;
+      let amountOut = Math.floor(numerator/denominator)
+
+      let aliceAccountAAfterSwap = await spl.getAccount(provider.connection, aliceTokenAAccount);
+      let aliceAccountBAfterSwap = await spl.getAccount(provider.connection, aliceTokenBAccount);
+      assert.equal(Number(aliceAccountAAfterSwap.amount) - Number(aliceAccountABeforeSwap.amount), amountOut);
+      assert.equal(Number(aliceAccountBBeforeSwap.amount) - Number(aliceAccountBAfterSwap.amount), amountIn);
+      
+    } catch (error) {
+      console.log("This is error in swap token for token", error);
     }
   });
 });
