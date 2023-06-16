@@ -3,7 +3,7 @@ use core::num;
 use anchor_lang::prelude::*;
 use anchor_spl::{
     associated_token::AssociatedToken,
-    token::{Mint, Token,TokenAccount, Transfer, MintTo},
+    token::{Mint, Token,TokenAccount, Transfer, MintTo, Burn},
 };
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
@@ -46,6 +46,14 @@ pub fn get_amount_out(amount_in: u64, reserve_in: u64, reserve_out: u64) -> Resu
     let denominator = (reserve_in * 10000) + amount_in_with_fee;
     let amount_out = numerator / denominator;
     Ok(amount_out)
+}
+
+pub fn get_amount_from_liquidity_tokens(token_a_reserves: u64, token_b_reserves: u64, liquidity_tokens: u64, total_lp_token_supply: u64) -> Result<(u64, u64)> {
+    require!(liquidity_tokens > 0, ErrorCodes::InsufficientLiquidityTokens);
+    require!(token_a_reserves > 0 && token_b_reserves > 0, ErrorCodes::InsufficientLiquidity); 
+    let amount_a = (liquidity_tokens * token_a_reserves)/total_lp_token_supply;
+    let amount_b = (liquidity_tokens * token_b_reserves)/total_lp_token_supply;
+    Ok((amount_a, amount_b))
 }
 
 #[program]
@@ -142,7 +150,90 @@ pub mod simple_amm {
         Ok(())
     }
 
-    pub fn remove_liquidity(ctx: Context<RemoveLiquidity>) -> Result<()> {
+    pub fn remove_liquidity(ctx: Context<RemoveLiquidity>, token_a_pool_bump: u8, token_b_pool_bump: u8, lp_token_bump: u8, liquidity_tokens: u64, amount_a_min: u64, amount_b_min: u64) -> Result<()> {
+        msg!("Add liquidity Called successfully");
+
+        let lp_token_mint = &ctx.accounts.liquidity_token_mint;
+        let token_a_mint = ctx.accounts.token_a_mint.key();
+        let token_b_mint = ctx.accounts.token_b_mint.key();
+        let token_a_pool = &ctx.accounts.token_a_pool;
+        let token_b_pool = &ctx.accounts.token_b_pool;
+        let token_a_account = &ctx.accounts.token_a_account;
+        let token_b_account = &ctx.accounts.token_b_account;
+
+        // Get reserves
+        let token_a_reserves = token_a_pool.amount;
+        let token_b_reserves = token_b_pool.amount;
+
+        let total_lp_token_supply = lp_token_mint.supply;
+
+        let (amount_a, amount_b) = get_amount_from_liquidity_tokens(token_a_reserves, token_b_reserves, liquidity_tokens, total_lp_token_supply).unwrap();
+
+        let bump_vector_a = token_a_pool_bump.to_le_bytes();
+        let inner_a = vec![
+            POOL_SEED,
+            token_a_mint.as_ref(),
+            token_b_mint.as_ref(),
+            bump_vector_a.as_ref(),
+        ];
+        let outer_a = vec![inner_a.as_slice()];
+
+        let transfer_instruction_a = Transfer {
+            from: token_a_pool.to_account_info(),
+            to: token_a_account.to_account_info(),
+            authority: token_a_pool.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            transfer_instruction_a,
+            outer_a.as_slice(), //signer PDA
+        );
+        anchor_spl::token::transfer(cpi_ctx, amount_a)?; 
+
+        let bump_vector_b = token_b_pool_bump.to_le_bytes();
+        let inner_b = vec![
+            POOL_SEED,
+            token_b_mint.as_ref(),
+            token_a_mint.as_ref(),
+            bump_vector_b.as_ref(),
+        ];
+        let outer_b = vec![inner_b.as_slice()];
+
+        let transfer_instruction_b = Transfer {
+            from: token_b_pool.to_account_info(),
+            to: token_b_account.to_account_info(),
+            authority: token_b_pool.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            transfer_instruction_b,
+            outer_b.as_slice(), //signer PDA
+        );
+        anchor_spl::token::transfer(cpi_ctx, amount_b)?; 
+
+        // Transfer lp tokens to mint PDA
+
+        let bump_vector = lp_token_bump.to_le_bytes();
+        let inner = vec![
+            LP_TOKEN_SEED,
+            token_a_mint.as_ref(),
+            token_b_mint.as_ref(),
+            bump_vector.as_ref(),
+        ];
+        let outer = vec![inner.as_slice()];
+
+        let burn_instruction = Burn {
+            mint: lp_token_mint.to_account_info(),
+            from: ctx.accounts.lp_token_account.to_account_info(),
+            authority: ctx.accounts.liquidity_provider.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            burn_instruction,
+            outer.as_slice(), //signer PDA
+        );
+        anchor_spl::token::burn(cpi_ctx, liquidity_tokens)?; 
+
         Ok(())
     }
 
@@ -273,7 +364,42 @@ pub struct AddLiquidity<'info> {
 }
 
 #[derive(Accounts)]
-pub struct RemoveLiquidity {}
+pub struct RemoveLiquidity<'info> {
+    #[account(mut)]
+    pub liquidity_provider: Signer<'info>,
+    #[account(mut, seeds = [AMM_STATE_SEED], bump)]
+    pub amm_state: Account<'info, AmmState>,
+    #[account(
+        mut,
+        seeds=[LP_TOKEN_SEED, token_a_mint.key().as_ref() , token_b_mint.key().as_ref()],
+        bump,
+    )]
+    pub liquidity_token_mint: Box<Account<'info, Mint>>,
+    #[account(mut)]
+    pub lp_token_account: Box<Account<'info, TokenAccount>>,
+    pub token_a_mint: Box<Account<'info, Mint>>,
+    pub token_b_mint: Box<Account<'info, Mint>>,
+    #[account(
+        mut, 
+        constraint=token_a_account.owner == liquidity_provider.key(),
+        constraint=token_a_account.mint == token_a_mint.key()
+    )]
+    pub token_a_account: Account<'info, TokenAccount>,
+    #[account(
+        mut, 
+        constraint=token_b_account.owner == liquidity_provider.key(),
+        constraint=token_b_account.mint == token_b_mint.key()
+    )]
+    pub token_b_account: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [POOL_SEED, token_a_mint.key().as_ref() , token_b_mint.key().as_ref()], bump, token::mint = token_a_mint, token::authority = token_a_pool)]
+    pub token_a_pool: Box<Account<'info, TokenAccount>>,
+    #[account(mut, seeds = [POOL_SEED, token_b_mint.key().as_ref() , token_a_mint.key().as_ref()], bump, token::mint = token_b_mint, token::authority = token_b_pool)]
+    pub token_b_pool: Box<Account<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
 
 #[derive(Accounts)]
 pub struct SwapToken<'info> {
@@ -337,5 +463,7 @@ pub enum ErrorCodes {
     #[msg("The amount of tokens to swap are insufficient, maybe equal to 0")]
     InsufficientInputAmountForSwap,
     #[msg("The amount of tokens to output are lesser than the minimum")]
-    InsufficientOutputAmountForSwap
+    InsufficientOutputAmountForSwap,
+    #[msg("The amount of liquidity tokens available are insufficient")]
+    InsufficientLiquidityTokens
 }
