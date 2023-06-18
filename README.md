@@ -37,4 +37,3 @@ So i need to send 1.351 WSOL to receive 20 USDC.
 The contract contains 4 methods:
 
 - Initialize AMM: This method would set an authority for the program and set the fees for the liquidity providers. Though the fees for liquidity providers is hard coded into the contract.
-- Add Liquidity: This method
